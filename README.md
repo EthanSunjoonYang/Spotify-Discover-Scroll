@@ -5,6 +5,8 @@ real Spotify listening history. Sign in with Spotify, swipe through tracks
 pulled from your top artists, recent plays, and genre picks, and save the
 ones you like straight to your real Spotify Liked Songs.
 
+Check it out here: https://spotify-enhancer-six.vercel.app/feed 
+
 ## Features
 
 - **Personalized, continuously replenished feed** - pulls a user's top
