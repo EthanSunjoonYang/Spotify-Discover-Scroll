@@ -76,6 +76,14 @@ export default function FeedClient() {
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const playerRef = useRef<any>(null);
+  // Tracks which track id is actually loaded into the current playback
+  // source (SDK device or <audio> element) so startPlayback can tell "resume
+  // the same track after a pause" apart from "a new card is now active."
+  // Only the latter should issue a fresh play-from-the-top call - the former
+  // should just un-pause in place. Without this distinction, toggling pause
+  // back off always restarted the SDK track / reset the <audio> element's
+  // src (which itself restarts playback), even for the exact same song.
+  const loadedTrackIdRef = useRef<string | null>(null);
   const queueRef = useRef<QueueItem[]>([]);
   const activeIndexRef = useRef(0);
   const actedRef = useRef<Set<string>>(new Set());
@@ -561,12 +569,21 @@ export default function FeedClient() {
   }, [sdkFailed]);
 
   // The actual "start playing the current card" routine, split out of the
-  // driving effect below purely for readability.
+  // driving effect below purely for readability. Resumes in place when the
+  // already-loaded track is being un-paused; only issues a fresh
+  // play-from-the-top call when the active card's track actually changed
+  // (see loadedTrackIdRef above).
   const startPlayback = useCallback(() => {
     if (!current) return;
+    const isSameTrack = loadedTrackIdRef.current === current.track.id;
 
     if (usingPreviewFallback) {
       if (audioRef.current) {
+        if (isSameTrack) {
+          audioRef.current.play().catch(() => {});
+          return;
+        }
+        loadedTrackIdRef.current = current.track.id;
         audioRef.current.src = current.track.preview_url || "";
         if (current.track.preview_url) {
           audioRef.current.play().catch(() => {});
@@ -575,7 +592,13 @@ export default function FeedClient() {
       return;
     }
 
+    if (isSameTrack) {
+      playerRef.current?.resume?.().catch(() => {});
+      return;
+    }
+
     audioRef.current?.pause();
+    loadedTrackIdRef.current = current.track.id;
     (async () => {
       const token = await fetchToken();
       if (!token) return;
