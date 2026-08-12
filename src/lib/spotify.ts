@@ -463,4 +463,12 @@ export async function refreshAccessToken(
   }
 }
 
-export { CLIENT_ID as SPOTIFY_CLIENT_ID, CLIENT_SECRET as SPOTIFY_CLIENT_SECRET };
+// Plain `export { CLIENT_ID as ... }` re-exports the ORIGINAL declared type
+// (string | undefined), not the `string` narrowing the throw-guard above
+// gives CLIENT_ID for the rest of this file - TS narrowing doesn't cross
+// the module boundary through an export alias. Re-declaring as a fresh
+// `const` with an explicit annotation carries the narrowed value through
+// correctly, so importers (auth.ts) see `string`, matching what's actually
+// guaranteed at runtime.
+export const SPOTIFY_CLIENT_ID: string = CLIENT_ID;
+export const SPOTIFY_CLIENT_SECRET: string = CLIENT_SECRET;
