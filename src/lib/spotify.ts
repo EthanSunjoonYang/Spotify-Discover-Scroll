@@ -231,7 +231,12 @@ export async function getMySavedTracksAll(
   const { trackContentKey, trackTitleKey, isDistinctiveTitleKey } =
     await import("./dedupe");
 
-  let url: string | null = "/me/tracks";
+  // Explicit limit=50 (this endpoint's actual max - distinct from /search's
+  // Feb 2026 limit=10 cap, which doesn't apply here) instead of the default
+  // page size of 20. This is called on every boost click as well as every
+  // refill, so fewer, larger pages meaningfully cuts the sequential round-trip
+  // count for anyone with a real-sized Liked Songs library.
+  let url: string | null = "/me/tracks?limit=50";
   let guard = 0;
   while (url && guard < 200) {
     guard++;

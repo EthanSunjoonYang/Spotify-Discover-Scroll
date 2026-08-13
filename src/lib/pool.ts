@@ -429,7 +429,26 @@ export async function boostFeed(
   accessToken: string,
   opts: BoostOptions
 ): Promise<PoolRow[]> {
-  const saved = await getMySavedTracksAll(accessToken);
+  // These four lookups are all independent (one Spotify call, three
+  // Supabase reads) - running them concurrently instead of one at a time
+  // shaves the sum of the Supabase round trips off every boost click's
+  // latency. refillPool already does this for its own independent fetches;
+  // this one was just never brought in line with that.
+  const [saved, historyResult, poolResult, suppressedArtistIds] =
+    await Promise.all([
+      getMySavedTracksAll(accessToken),
+      supabase
+        .from("track_history")
+        .select("track_id, track_key")
+        .eq("user_id", userId),
+      supabase
+        .from("track_pool")
+        .select("track_id, track_key")
+        .eq("user_id", userId),
+      // Respects "Less like this" here too: a boosted "similar" search
+      // could otherwise resurface a suppressed artist via genre overlap.
+      getSuppressedArtistIds(userId),
+    ]);
 
   // Same silent-failure gap as refillPool (see the comment there): every
   // Spotify helper returns [] on a 429, so without this check a
@@ -441,27 +460,17 @@ export async function boostFeed(
     );
   }
 
-  const { data: historyRows } = await supabase
-    .from("track_history")
-    .select("track_id, track_key")
-    .eq("user_id", userId);
+  const historyRows = historyResult.data;
   const historyIds = new Set((historyRows || []).map((r) => r.track_id));
   const historyKeys = new Set(
     (historyRows || []).map((r) => r.track_key).filter(Boolean) as string[]
   );
 
-  const { data: existingPool } = await supabase
-    .from("track_pool")
-    .select("track_id, track_key")
-    .eq("user_id", userId);
+  const existingPool = poolResult.data;
   const poolIds = new Set((existingPool || []).map((r) => r.track_id));
   const poolKeys = new Set(
     (existingPool || []).map((r) => r.track_key).filter(Boolean) as string[]
   );
-
-  // Respects "Less like this" here too: a boosted "similar" search could
-  // otherwise resurface a suppressed artist via genre overlap.
-  const suppressedArtistIds = await getSuppressedArtistIds(userId);
 
   const toTitleKeys = (keys: Set<string>) =>
     new Set(
