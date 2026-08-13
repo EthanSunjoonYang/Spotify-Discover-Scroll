@@ -181,9 +181,31 @@ export async function refillPool(
     // "feed drifts from my taste" fix: a much bigger, richer well of
     // personalized artists means refills stay personalized far longer
     // before ever needing to lean on genre discovery.
+    //
+    // Capped at TOP_ARTISTS_CAP, interleaved round-robin across the three
+    // ranges rather than concatenated short+medium+long in order - a
+    // straight concatenation-then-cap would just be short_term's 50 (it
+    // alone already fills the cap before medium/long ever contribute
+    // anything), which defeats the point above. Capping at all matters
+    // because this list gets searched one artist at a time, sequentially -
+    // the uncapped union can be up to 150, and for accounts with a lot of
+    // history/likes already excluding most results, the loop has no choice
+    // but to search through all 150 before giving up on finding anything
+    // new. That was measured as the single biggest contributor to Refresh
+    // Feed's worst-case latency, since it happens regardless of whether the
+    // two-phase fast-start (refillPoolFastStart) ever gets to respond
+    // early - if fewer than fastBatchSize new tracks are found before every
+    // source is exhausted, the response waits for the full loop either way.
+    const TOP_ARTISTS_CAP = 50;
     const topArtistMap = new Map<string, { id: string; name: string }>();
-    for (const a of [...topArtistsShort, ...topArtistsMedium, ...topArtistsLong]) {
-      if (!topArtistMap.has(a.id)) topArtistMap.set(a.id, a);
+    const timeRanges = [topArtistsShort, topArtistsMedium, topArtistsLong];
+    const longestRange = Math.max(...timeRanges.map((r) => r.length));
+    for (let i = 0; i < longestRange && topArtistMap.size < TOP_ARTISTS_CAP; i++) {
+      for (const range of timeRanges) {
+        if (topArtistMap.size >= TOP_ARTISTS_CAP) break;
+        const a = range[i];
+        if (a && !topArtistMap.has(a.id)) topArtistMap.set(a.id, a);
+      }
     }
     const topArtists = Array.from(topArtistMap.values());
 
