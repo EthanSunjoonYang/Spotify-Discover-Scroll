@@ -2,7 +2,14 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { getValidAccessToken, getPoolState } from "@/lib/supabase";
-import { refillPool } from "@/lib/pool";
+import { refillPoolFastStart } from "@/lib/pool";
+
+// Raises the ceiling on how long Vercel lets this invocation run - the
+// waitUntil-driven background phase inside refillPoolFastStart keeps going
+// after the response is sent, and needs more room than the platform
+// default to have a real chance of finishing the full pool build. Gets
+// clamped to whatever the actual plan allows either way.
+export const maxDuration = 60;
 
 const COOLDOWN_MS = 15_000;
 // Applied instead of COOLDOWN_MS when the last refill attempt failed with a
@@ -48,7 +55,7 @@ export async function POST() {
   }
 
   try {
-    const result = await refillPool(userId, tokens.access_token);
+    const result = await refillPoolFastStart(userId, tokens.access_token);
     return NextResponse.json({ status: "ok", ...result });
   } catch (err: any) {
     return NextResponse.json(

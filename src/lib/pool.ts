@@ -22,8 +22,17 @@ import {
   titleKeyFromContentKey,
   isDistinctiveTitleKey,
 } from "./dedupe";
+import { waitUntil } from "@vercel/functions";
 
 const TARGET_POOL_SIZE = 400;
+
+// How many tracks refillPoolFastStart waits for before responding to the
+// caller, and the chunk size used for every flush after that. Small enough
+// that "Refresh Feed" / the very first load feel close to instant instead
+// of blocking on the full, deliberately-sequential (rate-limit-safe)
+// TARGET_POOL_SIZE build.
+const FAST_BATCH_SIZE = 100;
+const BACKGROUND_CHUNK_SIZE = 100;
 
 // Cap how much of a single refill can come from non-personalized genre
 // discovery. Previously, once the (small) top-artist candidate well ran dry
@@ -115,7 +124,29 @@ function interleaveByArtist(groups: ArtistGroup[]): Candidate[] {
   return output;
 }
 
-export async function refillPool(userId: string, accessToken: string) {
+export interface RefillOptions {
+  // Caps how many NEW tracks this call collects (defaults to the full
+  // TARGET_POOL_SIZE). Lets a caller ask for a smaller top-up instead of
+  // always building toward the full target - e.g. refillPoolFastStart's
+  // background phase only needs "however many more get the pool to
+  // TARGET_POOL_SIZE," not another full TARGET_POOL_SIZE on top of what's
+  // already there.
+  maxNewTracks?: number;
+  // If set, flushes (interleaves + inserts) whatever's been collected so
+  // far as soon as totalCollected first reaches this many, fires
+  // onFastBatchReady, then keeps collecting and flushing every
+  // BACKGROUND_CHUNK_SIZE after that, up to maxNewTracks. Omit for the
+  // original single-flush-at-the-end behavior.
+  fastBatchSize?: number;
+  onFastBatchReady?: (result: { added: number }) => void;
+}
+
+export async function refillPool(
+  userId: string,
+  accessToken: string,
+  opts: RefillOptions = {}
+) {
+  const maxNewTracks = opts.maxNewTracks ?? TARGET_POOL_SIZE;
   await setPoolState(userId, { refilling: true, last_error: null });
 
   try {
@@ -247,7 +278,41 @@ export async function refillPool(userId: string, accessToken: string) {
     };
 
     let totalCollected = 0;
-    const budgetLeft = () => TARGET_POOL_SIZE - totalCollected;
+    const budgetLeft = () => maxNewTracks - totalCollected;
+
+    // Streams collected candidates to the DB in chunks instead of one bulk
+    // insert at the very end, so a caller can get an early, usable batch
+    // back (see fastBatchSize/onFastBatchReady) while collection keeps
+    // running in the background - this is what lets refillPoolFastStart
+    // respond almost immediately with the first ~100 tracks instead of
+    // blocking on the full pool build. Trade-off: each chunk is interleaved
+    // independently rather than the whole run being jointly interleaved at
+    // the end, so artist-spacing is slightly less globally optimal across
+    // chunk boundaries - acceptable for being able to stream results out at
+    // all. flush() is a no-op (aside from bookkeeping) once nothing new has
+    // accumulated, so calling it liberally between loop iterations is cheap.
+    let flushedTotal = 0;
+    let nextFlushAt = opts.fastBatchSize
+      ? Math.min(opts.fastBatchSize, maxNewTracks)
+      : maxNewTracks;
+    let fastCallbackFired = false;
+    const flush = async (force = false) => {
+      if (!force && totalCollected < nextFlushAt) return;
+      const chunkGroups = Array.from(artistGroups.values()).filter(
+        (g) => g.items.length > 0
+      );
+      const chunk = interleaveByArtist(chunkGroups);
+      for (const g of artistGroups.values()) g.items = [];
+      if (chunk.length > 0) {
+        await insertPoolCandidates(userId, chunk);
+        flushedTotal += chunk.length;
+      }
+      if (!fastCallbackFired) {
+        fastCallbackFired = true;
+        opts.onFastBatchReady?.({ added: flushedTotal });
+      }
+      nextFlushAt += BACKGROUND_CHUNK_SIZE;
+    };
 
     // Top artists (union of short/medium/long term): highest-weighted well.
     // This used to call GET /artists/{id}/top-tracks first (one API call,
@@ -273,6 +338,7 @@ export async function refillPool(userId: string, accessToken: string) {
           totalCollected++;
         }
       }
+      await flush();
     }
 
     // Recently played artists: medium weight, catches current listening
@@ -291,12 +357,13 @@ export async function refillPool(userId: string, accessToken: string) {
           totalCollected++;
         }
       }
+      await flush();
     }
 
     // Genre discovery: lowest weight, capped to a minority share of the
     // batch so it supplements rather than displaces personalized picks even
     // once the artist wells above start running low late in a session.
-    const genreBudget = Math.floor(TARGET_POOL_SIZE * MAX_GENRE_SHARE);
+    const genreBudget = Math.floor(maxNewTracks * MAX_GENRE_SHARE);
     let genreCollected = 0;
     for (const genre of GENRE_DISCOVERY_SEEDS) {
       if (budgetLeft() <= 0 || genreCollected >= genreBudget) break;
@@ -310,24 +377,25 @@ export async function refillPool(userId: string, accessToken: string) {
           genreCollected++;
         }
       }
+      await flush();
     }
 
-    const interleaved = interleaveByArtist(Array.from(artistGroups.values()));
+    // Force-flush whatever's left uncommitted (a partial chunk smaller than
+    // BACKGROUND_CHUNK_SIZE, or - if fastBatchSize was never reached at all,
+    // e.g. a very small library - the very first and only flush, which also
+    // fires onFastBatchReady here if it hasn't fired yet).
+    await flush(true);
 
     // Second check: rate limiting can also kick in partway through the
     // per-artist/recent/genre loops above rather than on the very first
     // batch. If it did AND we ended up with nothing to show for it, don't
-    // write a near-empty pool and call it a success - throw so this gets
-    // recorded as the real failure it is.
-    if (isSpotifyRateLimited() && interleaved.length === 0) {
+    // call this a success - throw so it gets recorded as the real failure
+    // it is.
+    if (isSpotifyRateLimited() && flushedTotal === 0) {
       throw new Error(
         "Spotify rate limit (429) hit partway through building your feed - backing off before trying again."
       );
     }
-
-    // insertPoolCandidates stamps created_at per row in array order, so the
-    // interleaved order above is exactly what getNextBatch will serve.
-    await insertPoolCandidates(userId, interleaved);
 
     // Second layer of defense: retroactively clean anything already liked
     // (in this app or directly in Spotify) out of the pool.
@@ -339,7 +407,7 @@ export async function refillPool(userId: string, accessToken: string) {
       last_error: null,
     });
 
-    return { added: interleaved.length };
+    return { added: flushedTotal };
   } catch (err: any) {
     // IMPORTANT: stamp last_refilled_at here too, not just on success.
     // /api/feed/refill's cooldown check gates on last_refilled_at - if a
@@ -356,6 +424,60 @@ export async function refillPool(userId: string, accessToken: string) {
     });
     throw err;
   }
+}
+
+/**
+ * Two-phase entry point for "Refresh Feed" and the initial/auto pool build:
+ * resolves as soon as the first FAST_BATCH_SIZE tracks are flushed, while
+ * the rest of the (still fully sequential, rate-limit-safe) collection
+ * keeps running to completion in the background via Vercel's waitUntil -
+ * see refillPool's fastBatchSize/onFastBatchReady. This is what makes those
+ * flows feel close to instant instead of blocking on the full pool build:
+ * the caller gets back a small, immediately-usable batch, and the pool
+ * keeps quietly filling in behind it for an endless-scroll feel rather than
+ * hitting a hard wall once the fast batch runs out.
+ *
+ * waitUntil keeps the serverless invocation alive past the point the
+ * caller's response is sent, but does NOT guarantee it can't still be
+ * interrupted by the platform's function-duration limit if the background
+ * phase runs long - that's fine here because flush() commits progress
+ * incrementally rather than only at the very end, so an interrupted run
+ * just leaves a partially-filled pool (still fully usable) instead of
+ * losing collected work. pool_state.refilling stays true for the ENTIRE
+ * duration (both phases), so a concurrent /api/feed/refill call from the
+ * client correctly sees "already refilling" and doesn't kick off a
+ * duplicate, overlapping collection run.
+ */
+export async function refillPoolFastStart(
+  userId: string,
+  accessToken: string,
+  opts: { maxNewTracks?: number } = {}
+): Promise<{ added: number }> {
+  let settleFast: (result: { added: number }) => void;
+  let rejectFast: (err: any) => void;
+  const fastResult = new Promise<{ added: number }>((resolve, reject) => {
+    settleFast = resolve;
+    rejectFast = reject;
+  });
+
+  const fullRun = refillPool(userId, accessToken, {
+    maxNewTracks: opts.maxNewTracks,
+    fastBatchSize: FAST_BATCH_SIZE,
+    onFastBatchReady: (result) => settleFast(result),
+  });
+
+  // Covers the case where the whole run fails before ever reaching a fast
+  // flush (e.g. an immediate rate limit) - without this, fastResult would
+  // just hang forever instead of surfacing the error to the caller.
+  fullRun.catch((err) => rejectFast(err));
+
+  waitUntil(
+    fullRun.catch((err) => {
+      console.error("[refillPoolFastStart] background phase failed:", err);
+    })
+  );
+
+  return fastResult;
 }
 
 interface BoostOptions {

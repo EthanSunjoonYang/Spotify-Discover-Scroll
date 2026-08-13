@@ -288,6 +288,20 @@ export default function FeedClient() {
   const handleResetFeed = useCallback(async () => {
     setResetting(true);
     setError(null);
+    // Clear the queue up front instead of after the rebuild finishes - the
+    // server-side rebuild is a real, multi-second-to-tens-of-seconds
+    // operation (it re-runs the same many-sequential-Spotify-call pool
+    // build as the initial load, deliberately not parallelized - see
+    // refillPool's comments on the rate-limit ban that caused), and leaving
+    // the stale feed on screen with just a small corner button label made
+    // that wait feel broken/unresponsive rather than in-progress. Clearing
+    // now falls through to the same full-screen "Building your feed…"
+    // state the very first load uses (see the `resetting` addition to that
+    // render gate below), which already sets the right expectation.
+    actedRef.current = new Set();
+    setLikedIds(new Set());
+    setQueue([]);
+    setActiveIndex(0);
     try {
       const res = await fetch("/api/feed/reset", { method: "POST" });
       const data = await res.json();
@@ -299,10 +313,6 @@ export default function FeedClient() {
         showErrorBanner(data.detail || "Couldn't refresh your feed.");
         return;
       }
-      actedRef.current = new Set();
-      setLikedIds(new Set());
-      setQueue([]);
-      setActiveIndex(0);
       await loadNextBatch();
     } catch (err: any) {
       showErrorBanner(err?.message || "Couldn't refresh your feed.");
@@ -653,16 +663,19 @@ export default function FeedClient() {
     );
   }
 
-  if (queue.length === 0 && (loading || building)) {
-    // Deliberately a single, fixed message rather than switching text based
-    // on `building` vs `loading` - a refill cycle flips through
-    // loading -> building -> loading again (fetch pool -> rebuild pool ->
-    // re-fetch the now-populated pool) before the queue is ready, and
-    // swapping the headline each time that happens read as an annoying
-    // flicker rather than progress.
+  if (queue.length === 0 && (loading || building || resetting)) {
+    // Deliberately a single, fixed message for the loading/building pair
+    // rather than switching text between them - a refill cycle flips
+    // through loading -> building -> loading again (fetch pool -> rebuild
+    // pool -> re-fetch the now-populated pool) before the queue is ready,
+    // and swapping the headline each time that happens read as an annoying
+    // flicker rather than progress. `resetting` doesn't have that problem
+    // (it's held true continuously by handleResetFeed for the whole
+    // operation, not toggled), so it gets its own accurate copy instead of
+    // reusing "Building" for what the user just explicitly asked to refresh.
     return (
       <main className="feed-status">
-        <h2>Building your feed…</h2>
+        <h2>{resetting ? "Refreshing your feed…" : "Building your feed…"}</h2>
         <p style={{ color: "#b3b3b3" }}>
           Top artists, recently played, and a bit of genre discovery - this
           can take a few seconds.
