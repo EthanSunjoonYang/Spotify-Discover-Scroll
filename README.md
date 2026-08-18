@@ -1,11 +1,12 @@
 # Discover Scroll
 
+Demo: https://youtu.be/TBkAitFd9Mk 
+
 A TikTok/Reels-style swipeable song discovery feed, built on top of a user's
 real Spotify listening history. Sign in with Spotify, swipe through tracks
 pulled from your top artists, recent plays, and genre picks, and save the
 ones you like straight to your real Spotify Liked Songs.
 
-Check it out here: https://spotify-enhancer-six.vercel.app/feed 
 
 ## Features
 
